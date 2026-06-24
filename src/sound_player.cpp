@@ -11,17 +11,27 @@
 namespace {
 
 constexpr int SAMPLE_RATE_HZ = 16000;
-constexpr int TONE_AMPLITUDE = 5000;
+constexpr int TONE_AMPLITUDE = 8000;
 
-constexpr float BASE_FREQUENCY_HZ = 330.0f;
-constexpr float FREQUENCY_SWING_HZ = 90.0f;
-constexpr float FREQUENCY_LFO_RATE = 0.35f;
+constexpr float MIN_NOTE_HZ = 440.0f;
+constexpr float MAX_NOTE_HZ = 1760.0f;
+constexpr float ROOT_NOTE_HZ = 440.0f;
+
+constexpr uint32_t HOLD_SAMPLES = SAMPLE_RATE_HZ * 2;
+constexpr uint32_t GLIDE_SAMPLES = SAMPLE_RATE_HZ / 2;
+constexpr uint32_t FADE_SAMPLES = SAMPLE_RATE_HZ;
+
+constexpr int kPentatonicSemitones[] = {0, 2, 4, 7, 9};
 
 constexpr UBaseType_t AUDIO_TASK_PRIORITY = 1;
 constexpr uint32_t AUDIO_TASK_STACK = 4096;
 
 TaskHandle_t audioTaskHandle = nullptr;
 volatile bool playbackActive = false;
+volatile uint32_t playbackDurationSamples = 0;
+
+float pentatonicNotes[16] = {};
+size_t pentatonicNoteCount = 0;
 
 void flushI2sSilence() {
   I2S.flush();
@@ -37,23 +47,90 @@ void initI2sOutput() {
   }
 }
 
+void buildPentatonicNotes() {
+  pentatonicNoteCount = 0;
+
+  for (int octave = 0; octave < 4; octave++) {
+    for (int semitone : kPentatonicSemitones) {
+      const float freq = ROOT_NOTE_HZ * powf(2.0f, (octave * 12 + semitone) / 12.0f);
+      if (freq >= MIN_NOTE_HZ && freq <= MAX_NOTE_HZ &&
+          pentatonicNoteCount < (sizeof(pentatonicNotes) / sizeof(pentatonicNotes[0]))) {
+        pentatonicNotes[pentatonicNoteCount++] = freq;
+      }
+    }
+  }
+}
+
+float pickRandomNote(float avoidHz) {
+  if (pentatonicNoteCount == 0) {
+    return ROOT_NOTE_HZ;
+  }
+  if (pentatonicNoteCount == 1) {
+    return pentatonicNotes[0];
+  }
+
+  float note = pentatonicNotes[0];
+  do {
+    note = pentatonicNotes[random(0, pentatonicNoteCount)];
+  } while (fabsf(note - avoidHz) < 0.1f);
+
+  return note;
+}
+
+float computeEnvelope(uint32_t sampleIndex, uint32_t durationSamples) {
+  if (durationSamples == 0) {
+    return 0.0f;
+  }
+
+  if (sampleIndex < FADE_SAMPLES) {
+    return static_cast<float>(sampleIndex) / static_cast<float>(FADE_SAMPLES);
+  }
+
+  if (durationSamples <= FADE_SAMPLES) {
+    return 0.0f;
+  }
+
+  const uint32_t fadeOutStart = durationSamples - FADE_SAMPLES;
+  if (sampleIndex >= fadeOutStart) {
+    if (sampleIndex >= durationSamples) {
+      return 0.0f;
+    }
+    return static_cast<float>(durationSamples - sampleIndex) / static_cast<float>(FADE_SAMPLES);
+  }
+
+  return 1.0f;
+}
+
 void audioTask(void* /*parameter*/) {
   float tonePhase = 0.0f;
-  float lfoPhase = 0.0f;
+  float currentFreq = ROOT_NOTE_HZ;
+  float glideStartFreq = ROOT_NOTE_HZ;
+  float glideTargetFreq = ROOT_NOTE_HZ;
+  uint32_t holdSamplesRemaining = 0;
+  uint32_t glideSamplesRemaining = 0;
+  bool gliding = false;
+  uint32_t playbackSampleIndex = 0;
 
   while (true) {
     if (!playbackActive) {
       ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+      currentFreq = pickRandomNote(-1.0f);
+      glideStartFreq = currentFreq;
+      glideTargetFreq = currentFreq;
+      gliding = false;
+      holdSamplesRemaining = HOLD_SAMPLES;
+      glideSamplesRemaining = 0;
+      playbackSampleIndex = 0;
       tonePhase = 0.0f;
-      lfoPhase = 0.0f;
       continue;
     }
 
-    const float frequencyHz =
-        BASE_FREQUENCY_HZ + FREQUENCY_SWING_HZ * sinf(lfoPhase);
-    const float phaseStep = (2.0f * PI * frequencyHz) / SAMPLE_RATE_HZ;
-    const int16_t sample =
-        static_cast<int16_t>(TONE_AMPLITUDE * sinf(tonePhase));
+    const uint32_t durationSamples = playbackDurationSamples;
+    const float envelope =
+        computeEnvelope(playbackSampleIndex, durationSamples);
+    const float phaseStep = (2.0f * PI * currentFreq) / SAMPLE_RATE_HZ;
+    const int16_t sample = static_cast<int16_t>(TONE_AMPLITUDE * envelope * sinf(tonePhase));
 
     I2S.write(sample);
     I2S.write(sample);
@@ -63,9 +140,31 @@ void audioTask(void* /*parameter*/) {
       tonePhase -= 2.0f * PI;
     }
 
-    lfoPhase += (2.0f * PI * FREQUENCY_LFO_RATE) / SAMPLE_RATE_HZ;
-    if (lfoPhase >= 2.0f * PI) {
-      lfoPhase -= 2.0f * PI;
+    playbackSampleIndex++;
+
+    if (gliding) {
+      const float progress =
+          1.0f - (static_cast<float>(glideSamplesRemaining) / static_cast<float>(GLIDE_SAMPLES));
+      currentFreq = glideStartFreq * powf(glideTargetFreq / glideStartFreq, progress);
+
+      if (glideSamplesRemaining > 0) {
+        glideSamplesRemaining--;
+      }
+
+      if (glideSamplesRemaining == 0) {
+        currentFreq = glideTargetFreq;
+        gliding = false;
+        holdSamplesRemaining = HOLD_SAMPLES;
+      }
+    } else if (holdSamplesRemaining > 0) {
+      holdSamplesRemaining--;
+
+      if (holdSamplesRemaining == 0) {
+        glideTargetFreq = pickRandomNote(currentFreq);
+        glideStartFreq = currentFreq;
+        gliding = true;
+        glideSamplesRemaining = GLIDE_SAMPLES;
+      }
     }
   }
 }
@@ -73,15 +172,17 @@ void audioTask(void* /*parameter*/) {
 }  // namespace
 
 void initSoundPlayer() {
+  buildPentatonicNotes();
   xTaskCreate(audioTask, "audio", AUDIO_TASK_STACK, nullptr, AUDIO_TASK_PRIORITY,
               &audioTaskHandle);
 }
 
-void startGentleTonePlayback() {
+void startGentleTonePlayback(uint32_t durationMs) {
   if (audioTaskHandle == nullptr) {
     return;
   }
 
+  playbackDurationSamples = (static_cast<uint64_t>(durationMs) * SAMPLE_RATE_HZ) / 1000;
   initI2sOutput();
   flushI2sSilence();
   playbackActive = true;

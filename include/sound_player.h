@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 void initSoundPlayer();
-void startGentleTonePlayback();
+void startGentleTonePlayback(uint32_t durationMs);
 void stopPlayback();

@@ -6,6 +6,8 @@
 #include "sound_level_monitor.h"
 #include "sound_player.h"
 
+constexpr uint32_t kAwakeDurationMs = 2 * 60 * 1000;
+
 namespace {
 
 static void asleepEnter() {
@@ -24,7 +26,7 @@ static void asleepExit() {
 
 static void awakeEnter() {
   resetAwakeColorPulse();
-  startGentleTonePlayback();
+  startGentleTonePlayback(kAwakeDurationMs);
 }
 
 static void awakeTick() {
@@ -37,8 +39,6 @@ static void awakeExit() {
 }
 
 }  // namespace
-
-constexpr uint32_t kAwakeDurationMs = 2 * 60 * 1000;
 
 State currentState = STATE_ASLEEP;
 uint32_t stateEnteredAtMs = 0;
