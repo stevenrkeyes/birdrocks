@@ -1,13 +1,29 @@
 #include <Arduino.h>
+#include <esp_rom_sys.h>
 
 #include "main_state_machine.h"
 #include "pins.h"
 #include "rgb_led.h"
 #include "sound_player.h"
 
+namespace {
+
+void earlyBootMarker() __attribute__((constructor(101)));
+
+void earlyBootMarker() {
+  esp_rom_printf("\n[rocks_mic] starting...\n");
+}
+
+}  // namespace
+
 void setup() {
-  delay(5000);
   Serial.begin(115200);
+  const uint32_t serialWaitStartMs = millis();
+  while (!Serial && (millis() - serialWaitStartMs) < 3000) {
+    delay(10);
+  }
+
+  Serial.println("rocks_mic booting...");
   randomSeed(micros());
 
   initRgbLed();
